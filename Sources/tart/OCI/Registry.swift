@@ -111,27 +111,24 @@ struct TokenResponse: Decodable, Authentication {
 }
 
 class Registry {
-  private let baseURL: URL
+  let baseURL: URL
   let namespace: String
   let credentialsProviders: [CredentialsProvider]
   let authenticationKeeper = AuthenticationKeeper()
 
-  var host: String? {
-    guard let host = baseURL.host else { return nil }
-
-    if let port = baseURL.port {
-      return "\(host):\(port)"
-    }
-
-    return host
-  }
+  // Host with an optional port (e.g. "127.0.0.1:5000"), which is used for naming
+  // and credentials lookup. For Docker Hub it stays "docker.io", while baseURL
+  // points to registry-1.docker.io.
+  let host: String?
 
   init(baseURL: URL,
        namespace: String,
+       host: String? = nil,
        credentialsProviders: [CredentialsProvider] = [EnvironmentCredentialsProvider(), DockerConfigCredentialsProvider(), KeychainCredentialsProvider()]
   ) throws {
     self.baseURL = baseURL
     self.namespace = namespace
+    self.host = host ?? Registry.hostWithPort(of: baseURL)
     self.credentialsProviders = credentialsProviders
   }
 
@@ -142,9 +139,9 @@ class Registry {
     credentialsProviders: [CredentialsProvider] = [EnvironmentCredentialsProvider(), DockerConfigCredentialsProvider(), KeychainCredentialsProvider()]
   ) throws {
     let proto = insecure ? "http" : "https"
-    let baseURLComponents = URLComponents(string: proto + "://" + host + "/v2/")!
+    var baseURLComponents = URLComponents(string: proto + "://" + host + "/v2/")!
 
-    guard let baseURL = baseURLComponents.url else {
+    guard var baseURL = baseURLComponents.url else {
       var hint = ""
 
       if host.hasPrefix("http://") || host.hasPrefix("https://") {
@@ -154,7 +151,33 @@ class Registry {
       throw RuntimeError.ImproperlyFormattedHost(host, hint)
     }
 
-    try self.init(baseURL: baseURL, namespace: namespace, credentialsProviders: credentialsProviders)
+    // Naming and credentials lookup use the host and port of the original URL,
+    // so it's "docker.io" for Docker Hub and "127.0.0.1:5000" for "127.0.0.1:05000"
+    let normalizedHost = Registry.hostWithPort(of: baseURL)
+
+    // Docker Hub serves its registry API from registry-1.docker.io, while docker.io,
+    // the host used in image names, redirects to Docker's website. URLSession follows
+    // these redirects, so we'd get an HTML page with HTTP 200 instead of an API
+    // response, which breaks pushing, pulling and "tart login" credentials validation.
+    //
+    // Host names are case insensitive, and only the host is replaced,
+    // so an explicit port like in "Docker.IO:443" is kept.
+    if baseURLComponents.host?.lowercased() == "docker.io" {
+      baseURLComponents.host = "registry-1.docker.io"
+      baseURL = baseURLComponents.url!
+    }
+
+    try self.init(baseURL: baseURL, namespace: namespace, host: normalizedHost, credentialsProviders: credentialsProviders)
+  }
+
+  private static func hostWithPort(of url: URL) -> String? {
+    guard let host = url.host else { return nil }
+
+    if let port = url.port {
+      return "\(host):\(port)"
+    }
+
+    return host
   }
 
   func ping() async throws {
@@ -421,12 +444,8 @@ class Registry {
     await authenticationKeeper.set(try TokenResponse.parse(fromData: data))
   }
 
-  private func lookupCredentials() throws -> (String, String)? {
-    var host = baseURL.host!
-
-    if let port = baseURL.port {
-      host += ":\(port)"
-    }
+  func lookupCredentials() throws -> (String, String)? {
+    let host = self.host!
 
     for provider in credentialsProviders {
       do {

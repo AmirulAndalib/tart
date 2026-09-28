@@ -122,6 +122,60 @@ final class CommandBehaviorTests: XCTestCase {
     XCTAssertFalse(RuntimeError.VMIsRunning("running").isFileNotFound())
   }
 
+  func testCloneRejectsExistingDestinationUnlessOverwriteIsRequested() async throws {
+    try await withTemporaryTartHome {
+      let source = try makeStandaloneVM(named: "source", diskContents: "source")
+      let destination = try makeStandaloneVM(named: "destination", diskContents: "existing")
+
+      let command = try Clone.parseAsRoot(["source", "destination"]) as! Clone
+
+      do {
+        try await command.run()
+        XCTFail("expected cloning over an existing VM to be rejected")
+      } catch let error as ValidationError {
+        XCTAssertEqual(error.message, "VM \"destination\" already exists, use --overwrite to replace it")
+      }
+
+      XCTAssertEqual(try Data(contentsOf: destination.diskURL), Data("existing".utf8))
+      XCTAssertTrue(FileManager.default.fileExists(atPath: source.diskURL.path))
+
+      let overwriteCommand = try Clone.parseAsRoot(["--overwrite", "source", "destination"]) as! Clone
+      try await overwriteCommand.run()
+
+      XCTAssertEqual(try Data(contentsOf: destination.diskURL), Data("source".utf8))
+    }
+  }
+
+  func testClonePreservesIncompleteDestination() async throws {
+    try await withTemporaryTartHome {
+      _ = try makeStandaloneVM(named: "source", diskContents: "source")
+      let storage = try VMStorageLocal()
+      let destination = storage.baseURL.appendingPathComponent("destination", isDirectory: true)
+      try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+      let diskURL = destination.appendingPathComponent("disk.img")
+      try Data("existing".utf8).write(to: diskURL)
+      XCTAssertFalse(storage.exists("destination"))
+
+      // Check both a local source and rejection before any remote registry access.
+      for source in ["source", "invalid.invalid/image:latest"] {
+        let command = try Clone.parseAsRoot([source, "destination"]) as! Clone
+        do {
+          try await command.run()
+          XCTFail("expected an incomplete destination to be preserved")
+        } catch let error as ValidationError {
+          XCTAssertEqual(error.message, "VM \"destination\" already exists, use --overwrite to replace it")
+        }
+        XCTAssertEqual(try Data(contentsOf: diskURL), Data("existing".utf8))
+        XCTAssertFalse(storage.exists("destination"))
+      }
+
+      let command = try Clone.parseAsRoot(["--overwrite", "source", "destination"]) as! Clone
+      try await command.run()
+      XCTAssertEqual(try Data(contentsOf: diskURL), Data("source".utf8))
+      XCTAssertTrue(storage.exists("destination"))
+    }
+  }
+
   func testSetDiskRejectsStackedVMBeforeSavingConfig() async throws {
     try await withTemporaryTartHome {
       let vmDir = try VMStorageLocal().create("stacked")
@@ -206,6 +260,14 @@ final class CommandBehaviorTests: XCTestCase {
       memorySizeMin: 512 * 1024 * 1024,
       diskFormat: .raw
     )
+  }
+
+  private func makeStandaloneVM(named name: String, diskContents: String) throws -> VMDirectory {
+    let vmDir = try VMStorageLocal().create(name)
+    try config().save(toURL: vmDir.configURL)
+    XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.nvramURL.path, contents: Data()))
+    XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.diskURL.path, contents: Data(diskContents.utf8)))
+    return vmDir
   }
 
   private func temporaryEntries() throws -> [URL] {
